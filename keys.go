@@ -19,9 +19,7 @@ type KeyInfo struct {
 // NewKeyInfo returns a KeyInfo with a random salt of DefaultSaltLen bytes.
 func NewKeyInfo(hasher Hasher, iters int) (KeyInfo, error) {
 	salt := make([]byte, DefaultSaltLen)
-	if _, err := rand.Read(salt); err != nil {
-		return KeyInfo{}, err
-	}
+	rand.Read(salt)
 	info := KeyInfo{Salt: salt, Iters: iters, Hasher: hasher}
 	return info, info.validate()
 }

@@ -400,7 +400,7 @@ func TestUsernamesAndAuthzid(t *testing.T) {
 		}
 	}
 	for _, u := range []string{"a\x00b", "\xff"} {
-		if _, err := NewClientConversation(ClientConfig{Username: u}).Step(nil); !errors.Is(err, ErrInvalidUsernameEncoding) {
+		if _, err := NewClientConversation(ClientConfig{Username: u, Lookup: ClientPasswordLookup("pw", sha256.New)}).Step(nil); !errors.Is(err, ErrInvalidUsernameEncoding) {
 			t.Errorf("%q: %v", u, err)
 		}
 	}
@@ -423,6 +423,46 @@ func TestUsernamesAndAuthzid(t *testing.T) {
 	cc.Authzid = "root"
 	if _, _, serr := exchange(cfg, cc); serr == nil {
 		t.Fatal("denied authzid accepted")
+	}
+
+	// Authorize must not run, and Authzid must not be reported, without a valid proof.
+	called := false
+	cfg.Authorize = func(string, string) error { called = true; return nil }
+	cc.Lookup = ClientPasswordLookup("wrong", sha256.New)
+	srv, _, serr = exchange(cfg, cc)
+	if serr == nil || called || srv.Authzid() != "" {
+		t.Fatal("authorize ran before authentication", serr, called, srv.Authzid())
+	}
+}
+
+func TestConfigValidation(t *testing.T) {
+	if _, err := NewServerConversation(&ServerConfig{}).Step([]byte("n,,n=a,r=b")); err == nil {
+		t.Fatal("nil Lookup accepted")
+	}
+	if _, err := NewServerConversation(nil).Step([]byte("n,,n=a,r=b")); err == nil {
+		t.Fatal("nil config accepted")
+	}
+	cfg := newTestServer(t, "pw")
+	cfg.RequireChannelBinding = true
+	if _, err := NewServerConversation(cfg).Step([]byte("n,,n=jeff,r=b")); err == nil {
+		t.Fatal("RequireChannelBinding without ChannelBinding accepted")
+	}
+	if _, err := NewClientConversation(ClientConfig{}).Step(nil); err == nil {
+		t.Fatal("nil client Lookup accepted")
+	}
+}
+
+func TestClientKeysAreCopies(t *testing.T) {
+	cfg := newTestServer(t, "pw")
+	srv, _, _ := exchange(cfg, ClientConfig{Username: "jeff", Lookup: ClientPasswordLookup("pw", sha256.New)})
+	a, err := srv.ClientKeys()
+	must(t, err)
+	clear(a.ClientKey)
+	clear(a.ServerKey)
+	clear(a.Salt)
+	b, _ := srv.ClientKeys()
+	if b.Validate() != nil || string(b.Salt) != string(testInfo.Salt) {
+		t.Fatal("ClientKeys shares memory with conversation or stored keys")
 	}
 }
 

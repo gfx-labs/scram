@@ -61,6 +61,10 @@ func NewClientConversation(cfg ClientConfig) *ClientConversation {
 // server-final-message it returns (nil, nil) and Done reports true. Any error
 // ends the conversation.
 func (c *ClientConversation) Step(in []byte) (out []byte, err error) {
+	if c.cfg.Lookup == nil {
+		c.state = stateFailed
+		return nil, errors.New("scram: ClientConfig.Lookup is required")
+	}
 	switch c.state {
 	case stateInitial:
 		if in != nil {

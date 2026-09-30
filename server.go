@@ -22,8 +22,9 @@ type ServerConfig struct {
 	// RequireChannelBinding rejects clients that do not use channel binding.
 	RequireChannelBinding bool
 
-	// Authorize decides whether username may act as authzid. If nil, any
-	// non-empty authzid is rejected.
+	// Authorize decides whether username may act as authzid. It runs only
+	// after the client has proved its identity. If nil, any non-empty authzid
+	// is rejected.
 	Authorize func(username, authzid string) error
 
 	// MockSecret keys the fake salt for unknown users. If nil a random
@@ -45,14 +46,22 @@ var (
 	processMockSecretOnce sync.Once
 )
 
-func (c *ServerConfig) mockKeys(username string) (ServerKeys, error) {
+func (c *ServerConfig) validate() error {
+	if c == nil || c.Lookup == nil {
+		return errors.New("scram: ServerConfig.Lookup is required")
+	}
+	if c.RequireChannelBinding && c.ChannelBinding == nil {
+		return errors.New("scram: RequireChannelBinding set without ChannelBinding")
+	}
+	return nil
+}
+
+func (c *ServerConfig) mockKeys(username string) ServerKeys {
 	secret := c.MockSecret
 	if secret == nil {
 		processMockSecretOnce.Do(func() {
 			processMockSecret = make([]byte, 32)
-			if _, err := rand.Read(processMockSecret); err != nil {
-				panic(err)
-			}
+			rand.Read(processMockSecret)
 		})
 		secret = processMockSecret
 	}
@@ -66,13 +75,9 @@ func (c *ServerConfig) mockKeys(username string) (ServerKeys, error) {
 		ServerKey: make([]byte, h.Size()),
 		KeyInfo:   KeyInfo{Salt: salt, Iters: orDefault(c.MockIters, DefaultMinIters), Hasher: h},
 	}
-	if _, err := rand.Read(keys.StoredKey); err != nil {
-		return ServerKeys{}, err
-	}
-	if _, err := rand.Read(keys.ServerKey); err != nil {
-		return ServerKeys{}, err
-	}
-	return keys, nil
+	rand.Read(keys.StoredKey)
+	rand.Read(keys.ServerKey)
+	return keys
 }
 
 type convState int
@@ -93,7 +98,8 @@ type ServerConversation struct {
 	keys     ServerKeys
 	mock     bool
 	username string
-	authzid  string
+	// requested authzid, approved only after the proof is verified
+	authzid string
 
 	gs2Header       string
 	clientFirstBare string
@@ -112,6 +118,10 @@ func NewServerConversation(cfg *ServerConfig) *ServerConversation {
 // failure may return both a server-final-message carrying e= and an error.
 // Any error ends the conversation.
 func (s *ServerConversation) Step(in []byte) (out []byte, err error) {
+	if err := s.cfg.validate(); err != nil {
+		s.fail()
+		return nil, err
+	}
 	switch s.state {
 	case stateInitial:
 		out, err = s.first(string(in))
@@ -148,8 +158,14 @@ func (s *ServerConversation) Authenticated() bool { return s.state == stateSucce
 // Username returns the username sent by the client.
 func (s *ServerConversation) Username() string { return s.username }
 
-// Authzid returns the authorization identity approved by Authorize, if any.
-func (s *ServerConversation) Authzid() string { return s.authzid }
+// Authzid returns the authorization identity approved by Authorize, or "" if
+// none was requested or the client has not authenticated.
+func (s *ServerConversation) Authzid() string {
+	if s.state != stateSucceeded {
+		return ""
+	}
+	return s.authzid
+}
 
 // ClientKeys returns the client's keys recovered from its proof, or an error
 // if the client has not authenticated. The keys are password-equivalent: they
@@ -161,7 +177,11 @@ func (s *ServerConversation) ClientKeys() (ClientKeys, error) {
 	return ClientKeys{
 		ClientKey: append([]byte(nil), s.clientKey...),
 		ServerKey: append([]byte(nil), s.keys.ServerKey...),
-		KeyInfo:   s.keys.KeyInfo,
+		KeyInfo: KeyInfo{
+			Salt:   append([]byte(nil), s.keys.Salt...),
+			Iters:  s.keys.Iters,
+			Hasher: s.keys.Hasher,
+		},
 	}, nil
 }
 
@@ -200,23 +220,17 @@ func (s *ServerConversation) first(in string) ([]byte, error) {
 		}
 	}
 
-	if cf.GS2.Authzid != "" {
-		if s.cfg.Authorize == nil {
-			return nil, ErrAuthzidNotAllowed
-		}
-		if err := s.cfg.Authorize(cf.Username, cf.GS2.Authzid); err != nil {
-			return nil, err
-		}
-		s.authzid = cf.GS2.Authzid
+	// Rejecting here depends only on config, so it reveals nothing about the user.
+	if cf.GS2.Authzid != "" && s.cfg.Authorize == nil {
+		return nil, ErrAuthzidNotAllowed
 	}
+	s.authzid = cf.GS2.Authzid
 
 	keys, err := s.cfg.Lookup(cf.Username)
 	switch {
 	case errors.Is(err, ErrUnknownUser):
 		s.mock = true
-		if keys, err = s.cfg.mockKeys(cf.Username); err != nil {
-			return nil, err
-		}
+		keys = s.cfg.mockKeys(cf.Username)
 	case err != nil:
 		return nil, err
 	default:
@@ -270,6 +284,12 @@ func (s *ServerConversation) final(in string) ([]byte, error) {
 	if !hmac.Equal(h.StoredKey(clientKey), s.keys.StoredKey) || s.mock {
 		clear(clientKey)
 		return nil, ErrInvalidProof
+	}
+	if s.authzid != "" {
+		if err := s.cfg.Authorize(s.username, s.authzid); err != nil {
+			clear(clientKey)
+			return nil, errors.Join(ErrAuthzidNotAllowed, err)
+		}
 	}
 	s.clientKey = clientKey
 
