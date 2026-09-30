@@ -2,6 +2,7 @@ package scram
 
 import (
 	"crypto/rand"
+	"errors"
 
 	"github.com/xdg-go/stringprep"
 )
@@ -24,6 +25,15 @@ func Normalize(password string) string {
 type ChannelBinding struct {
 	Type string
 	Data []byte
+}
+
+// validate rejects bindings with no data, which would bind to nothing while
+// appearing to succeed.
+func (cb *ChannelBinding) validate() error {
+	if cb != nil && (cb.Type == "" || len(cb.Data) == 0) {
+		return errors.New("scram: ChannelBinding requires Type and Data")
+	}
+	return nil
 }
 
 func authMessage(clientFirstBare, serverFirst, clientFinalWithoutProof string) []byte {

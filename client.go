@@ -65,6 +65,10 @@ func (c *ClientConversation) Step(in []byte) (out []byte, err error) {
 		c.state = stateFailed
 		return nil, errors.New("scram: ClientConfig.Lookup is required")
 	}
+	if err := c.cfg.ChannelBinding.validate(); err != nil {
+		c.state = stateFailed
+		return nil, err
+	}
 	switch c.state {
 	case stateInitial:
 		if in != nil {

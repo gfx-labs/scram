@@ -53,7 +53,7 @@ func (c *ServerConfig) validate() error {
 	if c.RequireChannelBinding && c.ChannelBinding == nil {
 		return errors.New("scram: RequireChannelBinding set without ChannelBinding")
 	}
-	return nil
+	return c.ChannelBinding.validate()
 }
 
 func (c *ServerConfig) mockKeys(username string) ServerKeys {

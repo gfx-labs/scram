@@ -450,6 +450,16 @@ func TestConfigValidation(t *testing.T) {
 	if _, err := NewClientConversation(ClientConfig{}).Step(nil); err == nil {
 		t.Fatal("nil client Lookup accepted")
 	}
+	empty := &ChannelBinding{Type: "tls-server-end-point"}
+	cfg = newTestServer(t, "pw")
+	cfg.ChannelBinding = empty
+	if _, err := NewServerConversation(cfg).Step([]byte("n,,n=jeff,r=b")); err == nil {
+		t.Fatal("server channel binding without data accepted")
+	}
+	cc := ClientConfig{Lookup: ClientPasswordLookup("pw", sha256.New), ChannelBinding: empty}
+	if _, err := NewClientConversation(cc).Step(nil); err == nil {
+		t.Fatal("client channel binding without data accepted")
+	}
 }
 
 func TestClientKeysAreCopies(t *testing.T) {
