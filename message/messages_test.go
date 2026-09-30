@@ -33,6 +33,10 @@ func TestParseServerFirst(t *testing.T) {
 		"r=abc,s=c2FsdA,i=1",    // unpadded
 		"r=abc,s=c2FsdA=x,i=1",
 		"r=abc,s=c2FsdB==,i=1", // non-canonical padding bits
+		"r=abc,s=c2Fs\ndA==,i=1",
+		"r=abc,s=c2Fs\r\ndA==,i=1",
+		"r=abc,s=c2FsdA==,i=04096",
+		"r=abc,s=c2FsdA==,i=1,x=",
 		"r=abc,s=,i=1",
 		"r=abc,s=c2FsdA==,i=0",
 		"r=abc,s=c2FsdA==,i=-1",
@@ -55,7 +59,7 @@ func TestParseClientFinal(t *testing.T) {
 	if err != nil || wp != "c=biws,r=abc,x=y" || string(m.ChannelBinding) != "n,," || m.Nonce != "abc" {
 		t.Fatal(m, wp, err)
 	}
-	for _, s := range []string{"c=biws,r=abc", "c=biws,p=AAAA", "c=biws,r=abc,p=", "c=biws,r=abc,p=AAAA,x=y", "c=biws,r=abc,m=x,p=AAAA", "c=,r=abc,p=AAAA"} {
+	for _, s := range []string{"c=biws,r=abc", "c=biws,p=AAAA", "c=biws,r=abc,p=", "c=biws,r=abc,p=AAAA,x=y", "c=biws,r=abc,m=x,p=AAAA", "c=,r=abc,p=AAAA", "c=bi\nws,r=abc,p=AAAA", "c=biws,r=abc,p=AA\nAA"} {
 		if _, _, err := ParseClientFinal(s); err == nil {
 			t.Errorf("%q accepted", s)
 		}

@@ -281,6 +281,10 @@ func checkExtensions(attrs []attr) error {
 		case 'a', 'n', 'r', 'c', 's', 'i', 'p', 'v', 'e':
 			return ErrInvalidEncoding
 		}
+		// attr-val = ALPHA "=" value, and value = 1*value-char.
+		if a.val == "" {
+			return ErrInvalidEncoding
+		}
 	}
 	return nil
 }

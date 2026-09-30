@@ -50,7 +50,8 @@ func parseAttrs(msg string) ([]attr, error) {
 }
 
 func decodeBase64(s string) ([]byte, error) {
-	if s == "" {
+	// encoding/base64 skips '\r' and '\n' even in strict mode. The RFC base64 grammar does not allow them.
+	if s == "" || strings.ContainsAny(s, "\r\n") {
 		return nil, ErrInvalidEncoding
 	}
 	b, err := b64.DecodeString(s)
@@ -60,8 +61,9 @@ func decodeBase64(s string) ([]byte, error) {
 	return b, nil
 }
 
+// parsePositiveInt parses posit-number = %x31-39 *DIGIT.
 func parsePositiveInt(s string) (int, error) {
-	if s == "" || strings.TrimLeft(s, "0123456789") != "" {
+	if s == "" || s[0] == '0' || strings.TrimLeft(s, "0123456789") != "" {
 		return 0, ErrInvalidEncoding
 	}
 	n, err := strconv.Atoi(s)
