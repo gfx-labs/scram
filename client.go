@@ -1,126 +1,179 @@
 package scram
 
 import (
-	"bytes"
 	"crypto/hmac"
-	"io"
+	"crypto/sha256"
+	"errors"
+	"fmt"
+	"strings"
 
 	"github.com/gfx-labs/scram/message"
 )
 
-func ClientPasswordLookup(password string, hasher Hasher) func(salt []byte, iters int) (ClientKeys, bool) {
-	return func(salt []byte, iters int) (ClientKeys, bool) {
-		saltedPassword := hasher.SaltedPassword([]byte(password), salt, iters)
-		clientKey := hasher.ClientKey(saltedPassword)
-		serverKey := hasher.ServerKey(saltedPassword)
-		return ClientKeys{
-			ClientKey: clientKey,
-			ServerKey: serverKey,
-			KeyInfo: KeyInfo{
-				Salt:   salt,
-				Iters:  iters,
-				Hasher: hasher,
-			},
-		}, true
-	}
+var sha256Hasher Hasher = sha256.New
+
+// ClientConfig configures a SCRAM client.
+type ClientConfig struct {
+	// Username is sent to the server. PostgreSQL clients usually send "".
+	Username string
+	// Authzid is an optional authorization identity.
+	Authzid string
+
+	// Lookup returns the client's keys for the salt and iteration count the
+	// server offered. See ClientPasswordLookup and ClientKeysLookup.
+	Lookup func(salt []byte, iters int) (ClientKeys, error)
+
+	// ChannelBinding, if set, is used and required.
+	ChannelBinding *ChannelBinding
+	// ClientSupportsChannelBinding should be true when the client supports
+	// channel binding but the server did not advertise it (for example
+	// SCRAM-SHA-256 was offered without SCRAM-SHA-256-PLUS). This sends the
+	// "y" flag so the server can detect a downgrade. Ignored if ChannelBinding is set.
+	ClientSupportsChannelBinding bool
+
+	// MinIters, MaxIters and MinSaltLen bound the parameters a server may send.
+	// Zero selects DefaultMinIters, DefaultMaxIters and DefaultMinSaltLen.
+	MinIters   int
+	MaxIters   int
+	MinSaltLen int
 }
 
-func ClientKeysLookup(keys ClientKeys) func(salt []byte, iters int) (ClientKeys, bool) {
-	return func(salt []byte, iters int) (ClientKeys, bool) {
-		if !bytes.Equal(keys.Salt, salt) {
-			return ClientKeys{}, false
-		}
-
-		if keys.Iters != iters {
-			return ClientKeys{}, false
-		}
-
-		return keys, true
-	}
-}
-
+// ClientConversation is one client-side SCRAM exchange. It is not safe for concurrent use.
 type ClientConversation struct {
-	User   string
-	Lookup func(salt []byte, iters int) (ClientKeys, bool)
+	cfg ClientConfig
 
-	// valid after state 0
-	clientFirstMessageWithoutHeader []byte
+	state           convState
+	gs2Header       string
+	clientFirstBare string
+	clientNonce     string
 
-	// valid after state 1
 	keys        ClientKeys
 	authMessage []byte
-
-	state int
 }
 
-func (T *ClientConversation) Write(msg []byte) (resp []byte, err error) {
-	switch T.state {
-	case 0:
-		var nonce []byte
-		nonce, err = AppendNonce(nil)
-		if err != nil {
-			return
-		}
+// NewClientConversation starts a client exchange.
+func NewClientConversation(cfg ClientConfig) *ClientConversation {
+	return &ClientConversation{cfg: cfg}
+}
 
-		resp = message.EncodeClientFirstMessage(nil, nil, []byte(T.User), nonce)
-		var ok bool
-		T.clientFirstMessageWithoutHeader, ok = message.StripClientFirstMessageHeader(resp)
-		if !ok {
-			err = ErrOtherError
-			return
+// Step returns the next client message. Call it first with nil to get the
+// client-first-message, then with each server message. After the
+// server-final-message it returns (nil, nil) and Done reports true. Any error
+// ends the conversation.
+func (c *ClientConversation) Step(in []byte) (out []byte, err error) {
+	switch c.state {
+	case stateInitial:
+		if in != nil {
+			err = errors.New("scram: client speaks first")
+		} else {
+			out, err = c.first()
 		}
-		T.state++
-		return
-	case 1:
-		nonce, salt, iters, ok := message.DecodeServerFirstMessage(msg)
-		if !ok {
-			err = ErrInvalidEncoding
-			return
-		}
-
-		T.keys, ok = T.Lookup(salt, iters)
-		if !ok {
-			err = ErrUnknownUser
-			return
-		}
-		storedKey := T.keys.Hasher.StoredKey(T.keys.ClientKey)
-		T.authMessage = AuthMessage(
-			T.clientFirstMessageWithoutHeader,
-			msg,
-			message.EncodeClientFinalMessageWithoutProof(
-				[]byte{0x6e, 0x2c, 0x2c},
-				nonce,
-			),
-		)
-		clientSignature := T.keys.Hasher.ClientSignature(storedKey, T.authMessage)
-		clientProof := T.keys.Hasher.ClientProof(T.keys.ClientKey, clientSignature)
-
-		resp = message.EncodeClientFinalMessage(
-			[]byte{0x6e, 0x2c, 0x2c},
-			nonce,
-			clientProof,
-		)
-		T.state++
-		return
-	case 2:
-		serverSignature, ok := message.DecodeServerFinalMessage(msg)
-		if !ok {
-			err = ErrInvalidEncoding
-			return
-		}
-
-		expectedServerKey := T.keys.Hasher.ServerSignature(T.keys.ServerKey, T.authMessage)
-
-		if !hmac.Equal(serverSignature, expectedServerKey) {
-			err = ErrInvalidProof
-			return
-		}
-
-		err = io.EOF
-		T.state++
-		return
+	case stateFirstDone:
+		out, err = c.final(string(in))
+	case stateFinalSent:
+		err = c.verify(string(in))
+		c.wipe()
 	default:
-		err = io.EOF
-		return
+		return nil, ErrConversationFinished
 	}
+	if err != nil {
+		c.state = stateFailed
+		c.wipe()
+		return nil, err
+	}
+	c.state++
+	return out, nil
+}
+
+// Done reports whether the conversation has finished, successfully or not.
+func (c *ClientConversation) Done() bool {
+	return c.state == stateSucceeded || c.state == stateFailed
+}
+
+// Authenticated reports whether the server proved knowledge of the verifier.
+func (c *ClientConversation) Authenticated() bool { return c.state == stateSucceeded }
+
+func (c *ClientConversation) wipe() {
+	c.keys = ClientKeys{}
+	c.authMessage = nil
+}
+
+func (c *ClientConversation) first() ([]byte, error) {
+	gs2 := message.GS2Header{CBFlag: message.CBNone, Authzid: c.cfg.Authzid}
+	switch {
+	case c.cfg.ChannelBinding != nil:
+		gs2.CBFlag = message.CBUsed
+		gs2.CBName = c.cfg.ChannelBinding.Type
+	case c.cfg.ClientSupportsChannelBinding:
+		gs2.CBFlag = message.CBUnsupported
+	}
+	c.clientNonce = newNonce()
+	full, bare, err := message.ClientFirst{GS2: gs2, Username: c.cfg.Username, Nonce: c.clientNonce}.Encode()
+	if err != nil {
+		return nil, err
+	}
+	c.gs2Header = full[:len(full)-len(bare)]
+	c.clientFirstBare = bare
+	return []byte(full), nil
+}
+
+func (c *ClientConversation) final(in string) ([]byte, error) {
+	sf, err := message.ParseServerFirst(in)
+	if err != nil {
+		return nil, err
+	}
+	if !strings.HasPrefix(sf.Nonce, c.clientNonce) || len(sf.Nonce) == len(c.clientNonce) {
+		return nil, ErrNonceMismatch
+	}
+	info := KeyInfo{Salt: sf.Salt, Iters: sf.Iters}
+	if err := info.checkPolicy(
+		orDefault(c.cfg.MinIters, DefaultMinIters),
+		orDefault(c.cfg.MaxIters, DefaultMaxIters),
+		orDefault(c.cfg.MinSaltLen, DefaultMinSaltLen),
+	); err != nil {
+		return nil, err
+	}
+
+	keys, err := c.cfg.Lookup(sf.Salt, sf.Iters)
+	if err != nil {
+		return nil, err
+	}
+	if err := keys.Validate(); err != nil {
+		return nil, err
+	}
+
+	cb := []byte(c.gs2Header)
+	if c.cfg.ChannelBinding != nil {
+		cb = append(cb, c.cfg.ChannelBinding.Data...)
+	}
+	msg := message.ClientFinal{ChannelBinding: cb, Nonce: sf.Nonce}
+	withoutProof, err := msg.EncodeWithoutProof()
+	if err != nil {
+		return nil, err
+	}
+	h := keys.Hasher
+	am := authMessage(c.clientFirstBare, in, withoutProof)
+	msg.Proof = xor(keys.ClientKey, h.ClientSignature(h.StoredKey(keys.ClientKey), am))
+	out, err := msg.Encode()
+	if err != nil {
+		return nil, err
+	}
+	c.keys = keys
+	c.authMessage = am
+	return []byte(out), nil
+}
+
+func (c *ClientConversation) verify(in string) error {
+	sf, err := message.ParseServerFinal(in)
+	if err != nil {
+		return err
+	}
+	if sf.Err != "" {
+		return fmt.Errorf("scram: server error: %w", sf.Err)
+	}
+	expected := c.keys.Hasher.ServerSignature(c.keys.ServerKey, c.authMessage)
+	if !hmac.Equal(sf.Verifier, expected) {
+		return ErrInvalidServerSignature
+	}
+	return nil
 }

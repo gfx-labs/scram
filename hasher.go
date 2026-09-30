@@ -1,103 +1,70 @@
 package scram
 
 import (
-	"bytes"
 	"crypto/hmac"
-	"encoding/binary"
+	"crypto/pbkdf2"
+	"crypto/subtle"
+	"errors"
 	"hash"
 )
 
+// Hasher constructs the hash used by a SCRAM mechanism, for example sha256.New for SCRAM-SHA-256.
 type Hasher func() hash.Hash
 
-func (T Hasher) HMAC(key []byte, str []byte) []byte {
-	h := hmac.New(T, key)
-	h.Write(str)
-	return h.Sum(nil)
+// Size returns the output size of the hash in bytes.
+func (h Hasher) Size() int { return h().Size() }
+
+// HMAC returns HMAC(key, msg).
+func (h Hasher) HMAC(key, msg []byte) []byte {
+	m := hmac.New(h, key)
+	m.Write(msg)
+	return m.Sum(nil)
 }
 
-// Hi is PBKDF2(HMAC, str, salt, iterationCount, output length of HMAC)
-func (T Hasher) Hi(str []byte, salt []byte, iterationCount int) []byte {
-	if iterationCount < 1 {
-		panic("iterationCount must be >= 1")
+// H returns H(msg).
+func (h Hasher) H(msg []byte) []byte {
+	d := h()
+	d.Write(msg)
+	return d.Sum(nil)
+}
+
+// SaltedPassword returns Hi(Normalize(password), salt, iters), where Hi is PBKDF2.
+func (h Hasher) SaltedPassword(password string, salt []byte, iters int) ([]byte, error) {
+	if h == nil || iters < 1 || len(salt) == 0 {
+		return nil, errors.New("scram: invalid key derivation parameters")
 	}
+	return pbkdf2.Key(h, Normalize(password), salt, iters, h.Size())
+}
 
-	hasher := hmac.New(T, str)
+// ClientKey returns HMAC(saltedPassword, "Client Key").
+func (h Hasher) ClientKey(saltedPassword []byte) []byte {
+	return h.HMAC(saltedPassword, []byte("Client Key"))
+}
 
-	salt1 := make([]byte, len(salt), len(salt)+4)
-	copy(salt1, salt)
-	salt1 = binary.BigEndian.AppendUint32(salt1, 1)
-	hasher.Write(salt1)
-	hi := hasher.Sum(nil)
-	ui := bytes.Clone(hi)
+// ServerKey returns HMAC(saltedPassword, "Server Key").
+func (h Hasher) ServerKey(saltedPassword []byte) []byte {
+	return h.HMAC(saltedPassword, []byte("Server Key"))
+}
 
-	for i := 1; i < iterationCount; i++ {
-		hasher.Reset()
-		hasher.Write(ui)
-		ui = hasher.Sum(ui[:0])
-		if len(ui) != len(hi) {
-			panic("expected len(ui) == len(hi)")
-		}
-		for j, a := range hi {
-			b := ui[j]
-			hi[j] = a ^ b
-		}
+// StoredKey returns H(clientKey).
+func (h Hasher) StoredKey(clientKey []byte) []byte { return h.H(clientKey) }
+
+// ClientSignature returns HMAC(storedKey, authMessage).
+func (h Hasher) ClientSignature(storedKey, authMessage []byte) []byte {
+	return h.HMAC(storedKey, authMessage)
+}
+
+// ServerSignature returns HMAC(serverKey, authMessage).
+func (h Hasher) ServerSignature(serverKey, authMessage []byte) []byte {
+	return h.HMAC(serverKey, authMessage)
+}
+
+// xor returns a XOR b, or nil if the lengths differ.
+func xor(a, b []byte) []byte {
+	if len(a) != len(b) {
+		return nil
 	}
-
-	return hi
-}
-
-// SaltedPassword is Hi(Normalize(password), salt, iterationCount)
-func (T Hasher) SaltedPassword(password []byte, salt []byte, iterationCount int) []byte {
-	return T.Hi(Normalize(password), salt, iterationCount)
-}
-
-var (
-	clientKeyMessage = []byte("Client Key")
-	serverKeyMessage = []byte("Server Key")
-)
-
-// ClientKey is HMAC(saltedPassword, 'Client Key')
-func (T Hasher) ClientKey(saltedPassword []byte) []byte {
-	return T.HMAC(saltedPassword, clientKeyMessage)
-}
-
-// ServerKey is HMAC(saltedPassword, 'Server Key')
-func (T Hasher) ServerKey(saltedPassword []byte) []byte {
-	return T.HMAC(saltedPassword, serverKeyMessage)
-}
-
-func (T Hasher) H(str []byte) []byte {
-	h := T()
-	h.Write(str)
-	return h.Sum(nil)
-}
-
-// StoredKey is H(clientKey)
-func (T Hasher) StoredKey(clientKey []byte) []byte {
-	return T.H(clientKey)
-}
-
-// ClientSignature is HMAC(storedKey, authMessage)
-func (T Hasher) ClientSignature(storedKey []byte, authMessage []byte) []byte {
-	return T.HMAC(storedKey, authMessage)
-}
-
-// ClientProof is clientKey XOR clientSignature
-func (T Hasher) ClientProof(clientKey []byte, clientSignature []byte) []byte {
-	if len(clientKey) != len(clientSignature) {
-		panic("expected len(clientKey) == len(clientSignature)")
-	}
-
-	var res = make([]byte, len(clientKey))
-	for i, a := range clientKey {
-		b := clientSignature[i]
-		res[i] = a ^ b
-	}
-
-	return res
-}
-
-// ServerSignature is HMAC(serverKey, authMessage)
-func (T Hasher) ServerSignature(serverKey []byte, authMessage []byte) []byte {
-	return T.HMAC(serverKey, authMessage)
+	out := make([]byte, len(a))
+	subtle.XORBytes(out, a, b)
+	return out
 }

@@ -1,105 +1,281 @@
 package scram
 
 import (
-	"bytes"
-	"io"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/subtle"
+	"errors"
+	"sync"
 
 	"github.com/gfx-labs/scram/message"
 )
 
-type ServerConversation struct {
-	// Lookup keys by username
-	Lookup func(user string) (ServerKeys, bool)
+// ServerConfig configures a SCRAM server. It is safe to share between conversations.
+type ServerConfig struct {
+	// Lookup returns the stored keys for a username. Return ErrUnknownUser if the
+	// user does not exist. The server then runs a mock exchange so unknown users
+	// cannot be told apart from a wrong password. Other errors abort the exchange.
+	Lookup func(username string) (ServerKeys, error)
 
-	// valid after state 0
-	keys                            ServerKeys
-	nonce                           []byte
-	clientFirstMessageWithoutHeader []byte
-	serverFirstMessage              []byte
+	// ChannelBinding is the channel binding the server supports, or nil for none.
+	ChannelBinding *ChannelBinding
+	// RequireChannelBinding rejects clients that do not use channel binding.
+	RequireChannelBinding bool
 
-	// valid after state 1
-	RecoveredClientKey []byte
+	// Authorize decides whether username may act as authzid. If nil, any
+	// non-empty authzid is rejected.
+	Authorize func(username, authzid string) error
 
-	state int
+	// MockSecret keys the fake salt for unknown users. If nil a random
+	// per-process secret is used, so fake salts change across restarts.
+	MockSecret []byte
+	// MockHasher and MockIters describe the fake verifier for unknown users.
+	// They should match real users. Defaults: sha256, DefaultMinIters.
+	MockHasher Hasher
+	MockIters  int
+
+	// MinIters and MinSaltLen reject weak stored keys. Zero selects
+	// DefaultMinIters and DefaultMinSaltLen. Set 1 to disable.
+	MinIters   int
+	MinSaltLen int
 }
 
-func (T *ServerConversation) Write(msg []byte) (resp []byte, err error) {
-	switch T.state {
-	case 0:
-		_, _, user, nonce, ok := message.DecodeClientFirstMessage(msg)
-		if !ok {
-			err = ErrInvalidEncoding
-			return
-		}
-		T.keys, ok = T.Lookup(string(user))
-		if !ok {
-			err = ErrUnknownUser
-			return
-		}
-		nonce, err = AppendNonce(nonce)
-		if err != nil {
-			return
-		}
-		T.nonce = nonce
+var (
+	processMockSecret     []byte
+	processMockSecretOnce sync.Once
+)
 
-		T.clientFirstMessageWithoutHeader, ok = message.StripClientFirstMessageHeader(msg)
-		if !ok {
-			err = ErrInvalidEncoding
-			return
-		}
-
-		resp = message.EncodeServerFirstMessage(
-			nonce,
-			T.keys.Salt,
-			T.keys.Iters,
-		)
-		T.serverFirstMessage = resp
-		T.state++
-		return
-	case 1:
-		_, nonce, proof, ok := message.DecodeClientFinalMessage(msg)
-		if !ok {
-			err = ErrInvalidEncoding
-			return
-		}
-		if !bytes.Equal(T.nonce, nonce) {
-			err = ErrOtherError
-			return
-		}
-
-		clientFinalMessageWithoutProof, ok := message.StripClientFinalMessageProof(msg)
-		if !ok {
-			err = ErrInvalidEncoding
-			return
-		}
-		authMessage := AuthMessage(T.clientFirstMessageWithoutHeader, T.serverFirstMessage, clientFinalMessageWithoutProof)
-
-		// recover client key
-		serverSignature := T.keys.Hasher.ServerSignature(T.keys.ServerKey, authMessage)
-		clientSignature := T.keys.Hasher.ClientSignature(T.keys.StoredKey, authMessage)
-		if len(clientSignature) != len(proof) {
-			err = ErrInvalidProof
-			return
-		}
-		T.RecoveredClientKey = make([]byte, len(clientSignature))
-		for i, a := range clientSignature {
-			b := proof[i]
-			T.RecoveredClientKey[i] = a ^ b
-		}
-
-		// check client key
-		storedKey := T.keys.Hasher.StoredKey(T.RecoveredClientKey)
-		if !bytes.Equal(storedKey, T.keys.StoredKey) {
-			err = ErrInvalidProof
-			return
-		}
-
-		resp = message.EncodeServerFinalMessage(serverSignature)
-		err = io.EOF
-		T.state++
-		return
-	default:
-		err = io.EOF
-		return
+func (c *ServerConfig) mockKeys(username string) (ServerKeys, error) {
+	secret := c.MockSecret
+	if secret == nil {
+		processMockSecretOnce.Do(func() {
+			processMockSecret = make([]byte, 32)
+			if _, err := rand.Read(processMockSecret); err != nil {
+				panic(err)
+			}
+		})
+		secret = processMockSecret
 	}
+	h := c.MockHasher
+	if h == nil {
+		h = sha256Hasher
+	}
+	salt := Hasher(sha256Hasher).HMAC(secret, []byte("salt:"+username))[:DefaultSaltLen]
+	keys := ServerKeys{
+		StoredKey: make([]byte, h.Size()),
+		ServerKey: make([]byte, h.Size()),
+		KeyInfo:   KeyInfo{Salt: salt, Iters: orDefault(c.MockIters, DefaultMinIters), Hasher: h},
+	}
+	if _, err := rand.Read(keys.StoredKey); err != nil {
+		return ServerKeys{}, err
+	}
+	if _, err := rand.Read(keys.ServerKey); err != nil {
+		return ServerKeys{}, err
+	}
+	return keys, nil
+}
+
+type convState int
+
+const (
+	stateInitial convState = iota
+	stateFirstDone
+	stateFinalSent // client only
+	stateSucceeded
+	stateFailed
+)
+
+// ServerConversation is one server-side SCRAM exchange. It is not safe for concurrent use.
+type ServerConversation struct {
+	cfg *ServerConfig
+
+	state    convState
+	keys     ServerKeys
+	mock     bool
+	username string
+	authzid  string
+
+	gs2Header       string
+	clientFirstBare string
+	serverFirst     string
+	nonce           string
+
+	clientKey []byte
+}
+
+// NewServerConversation starts a server exchange. The config must not be modified afterwards.
+func NewServerConversation(cfg *ServerConfig) *ServerConversation {
+	return &ServerConversation{cfg: cfg}
+}
+
+// Step processes a client message and returns the reply. On the final step a
+// failure may return both a server-final-message carrying e= and an error.
+// Any error ends the conversation.
+func (s *ServerConversation) Step(in []byte) (out []byte, err error) {
+	switch s.state {
+	case stateInitial:
+		out, err = s.first(string(in))
+		if err != nil {
+			s.fail()
+			return nil, err
+		}
+		s.state = stateFirstDone
+		return out, nil
+	case stateFirstDone:
+		out, err = s.final(string(in))
+		if err != nil {
+			s.fail()
+			var e Error
+			if !errors.As(err, &e) {
+				e = ErrOtherError
+			}
+			msg, _ := message.ServerFinal{Err: e}.Encode()
+			return []byte(msg), err
+		}
+		s.state = stateSucceeded
+		return out, nil
+	default:
+		return nil, ErrConversationFinished
+	}
+}
+
+// Done reports whether the conversation has finished, successfully or not.
+func (s *ServerConversation) Done() bool { return s.state >= stateSucceeded }
+
+// Authenticated reports whether the client proved knowledge of the password.
+func (s *ServerConversation) Authenticated() bool { return s.state == stateSucceeded }
+
+// Username returns the username sent by the client.
+func (s *ServerConversation) Username() string { return s.username }
+
+// Authzid returns the authorization identity approved by Authorize, if any.
+func (s *ServerConversation) Authzid() string { return s.authzid }
+
+// ClientKeys returns the client's keys recovered from its proof, or an error
+// if the client has not authenticated. The keys are password-equivalent: they
+// can be used to authenticate as this user to any server sharing the verifier.
+func (s *ServerConversation) ClientKeys() (ClientKeys, error) {
+	if s.state != stateSucceeded {
+		return ClientKeys{}, ErrInvalidProof
+	}
+	return ClientKeys{
+		ClientKey: append([]byte(nil), s.clientKey...),
+		ServerKey: append([]byte(nil), s.keys.ServerKey...),
+		KeyInfo:   s.keys.KeyInfo,
+	}, nil
+}
+
+func (s *ServerConversation) fail() {
+	s.state = stateFailed
+	clear(s.clientKey)
+	s.clientKey = nil
+}
+
+func (s *ServerConversation) first(in string) ([]byte, error) {
+	cf, gs2, bare, err := message.ParseClientFirst(in)
+	if err != nil {
+		return nil, err
+	}
+
+	cb := s.cfg.ChannelBinding
+	switch cf.GS2.CBFlag {
+	case message.CBNone:
+		if s.cfg.RequireChannelBinding {
+			return nil, ErrChannelBindingsDontMatch
+		}
+	case message.CBUnsupported:
+		// The client could have used channel binding but believes we do not support it: a downgrade.
+		if cb != nil {
+			return nil, ErrServerDoesSupportChannelBinding
+		}
+		if s.cfg.RequireChannelBinding {
+			return nil, ErrChannelBindingsDontMatch
+		}
+	case message.CBUsed:
+		if cb == nil {
+			return nil, ErrChannelBindingNotSupported
+		}
+		if cf.GS2.CBName != cb.Type {
+			return nil, ErrUnsupportedChannelBindingType
+		}
+	}
+
+	if cf.GS2.Authzid != "" {
+		if s.cfg.Authorize == nil {
+			return nil, ErrAuthzidNotAllowed
+		}
+		if err := s.cfg.Authorize(cf.Username, cf.GS2.Authzid); err != nil {
+			return nil, err
+		}
+		s.authzid = cf.GS2.Authzid
+	}
+
+	keys, err := s.cfg.Lookup(cf.Username)
+	switch {
+	case errors.Is(err, ErrUnknownUser):
+		s.mock = true
+		if keys, err = s.cfg.mockKeys(cf.Username); err != nil {
+			return nil, err
+		}
+	case err != nil:
+		return nil, err
+	default:
+		if err := keys.Validate(); err != nil {
+			return nil, err
+		}
+		if err := keys.checkPolicy(orDefault(s.cfg.MinIters, DefaultMinIters), 0, orDefault(s.cfg.MinSaltLen, DefaultMinSaltLen)); err != nil {
+			return nil, err
+		}
+	}
+
+	nonce := cf.Nonce + newNonce()
+	sf, err := message.ServerFirst{Nonce: nonce, Salt: keys.Salt, Iters: keys.Iters}.Encode()
+	if err != nil {
+		return nil, err
+	}
+
+	s.keys = keys
+	s.username = cf.Username
+	s.gs2Header = gs2
+	s.clientFirstBare = bare
+	s.serverFirst = sf
+	s.nonce = nonce
+	return []byte(sf), nil
+}
+
+func (s *ServerConversation) final(in string) ([]byte, error) {
+	cf, withoutProof, err := message.ParseClientFinal(in)
+	if err != nil {
+		return nil, err
+	}
+	if subtle.ConstantTimeCompare([]byte(cf.Nonce), []byte(s.nonce)) != 1 {
+		return nil, ErrInvalidProof
+	}
+
+	expectedCB := []byte(s.gs2Header)
+	if s.cfg.ChannelBinding != nil && s.gs2Header[0] == message.CBUsed {
+		expectedCB = append(expectedCB, s.cfg.ChannelBinding.Data...)
+	}
+	if !hmac.Equal(cf.ChannelBinding, expectedCB) {
+		return nil, ErrChannelBindingsDontMatch
+	}
+
+	h := s.keys.Hasher
+	am := authMessage(s.clientFirstBare, s.serverFirst, withoutProof)
+	clientSig := h.ClientSignature(s.keys.StoredKey, am)
+	clientKey := xor(cf.Proof, clientSig)
+	if clientKey == nil {
+		return nil, ErrInvalidProof
+	}
+	if !hmac.Equal(h.StoredKey(clientKey), s.keys.StoredKey) || s.mock {
+		clear(clientKey)
+		return nil, ErrInvalidProof
+	}
+	s.clientKey = clientKey
+
+	out, err := message.ServerFinal{Verifier: h.ServerSignature(s.keys.ServerKey, am)}.Encode()
+	if err != nil {
+		return nil, err
+	}
+	return []byte(out), nil
 }

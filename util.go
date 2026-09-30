@@ -2,46 +2,47 @@ package scram
 
 import (
 	"crypto/rand"
-	"encoding/base64"
-	"io"
 
 	"github.com/xdg-go/stringprep"
 )
 
-func Normalize(str []byte) []byte {
-	res, err := stringprep.SASLprep.Prepare(string(str))
-	if err != nil {
-		return nil
-	}
-	return []byte(res)
-}
+// newNonce is replaced in tests to reproduce RFC test vectors.
+var newNonce = rand.Text
 
-// AuthMessage is clientFirstMessageWithoutHeader + "," + serverFirstMessage + "," + clientFinalMessageWithoutProof
-func AuthMessage(clientFirstMessageWithoutHeader []byte, serverFirstMessage []byte, clientFinalMessageWithoutProof []byte) []byte {
-	var res = make([]byte, len(clientFirstMessageWithoutHeader)+len(serverFirstMessage)+len(clientFinalMessageWithoutProof)+2)
-	n := copy(res, clientFirstMessageWithoutHeader)
-	res[n] = ','
-	n++
-	n += copy(res[n:], serverFirstMessage)
-	res[n] = ','
-	n++
-	copy(res[n:], clientFinalMessageWithoutProof)
+// Normalize applies SASLprep to a password. Like PostgreSQL, it returns the
+// input unchanged if SASLprep fails, so distinct passwords never collide.
+func Normalize(password string) string {
+	res, err := stringprep.SASLprep.Prepare(password)
+	if err != nil {
+		return password
+	}
 	return res
 }
 
-func AppendNonce(buf []byte) ([]byte, error) {
-	raw := make([]byte, 24)
-	_, err := io.ReadFull(rand.Reader, raw)
-	if err != nil {
-		return nil, err
-	}
+// ChannelBinding identifies a channel binding type and its data, for example
+// "tls-server-end-point" and the hash of the server certificate.
+type ChannelBinding struct {
+	Type string
+	Data []byte
+}
 
-	size := base64.StdEncoding.EncodedLen(24)
-	start := len(buf)
-	for i := 0; i < size; i++ {
-		buf = append(buf, 0)
-	}
+func authMessage(clientFirstBare, serverFirst, clientFinalWithoutProof string) []byte {
+	return []byte(clientFirstBare + "," + serverFirst + "," + clientFinalWithoutProof)
+}
 
-	base64.StdEncoding.Encode(buf[start:], raw)
-	return buf, nil
+// Default parameter policy.
+const (
+	// DefaultMinIters is the minimum iteration count from RFC 7677.
+	DefaultMinIters = 4096
+	// DefaultMaxIters bounds the work a server can make a client do.
+	DefaultMaxIters = 1_000_000
+	// DefaultMinSaltLen is the shortest salt accepted by default.
+	DefaultMinSaltLen = 8
+)
+
+func orDefault(v, def int) int {
+	if v == 0 {
+		return def
+	}
+	return v
 }

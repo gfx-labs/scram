@@ -1,23 +1,36 @@
 package scram
 
-type scramError string
+import (
+	"errors"
 
-func (T scramError) Error() string {
-	return string(T)
-}
+	"github.com/gfx-labs/scram/message"
+)
 
-var _ error = scramError("")
+// Error is a SCRAM server-error-value. It is safe to send to the peer.
+type Error = message.Error
 
+// SCRAM server-error-values (RFC 5802 section 7).
 const (
-	ErrInvalidEncoding                 scramError = "invalid-encoding"
-	ErrExtensionsNotSupported          scramError = "extensions-not-supported"
-	ErrInvalidProof                    scramError = "invalid-proof"
-	ErrChannelBindingsDontMatch        scramError = "channel-bindings-dont-match"
-	ErrServerDoesSupportChannelBinding scramError = "server-does-support-channel-binding"
-	ErrChannelBindingNotSupported      scramError = "channel-binding-not-supported"
-	ErrUnsupportedChannelBindingType   scramError = "unsupported-channel-binding-type"
-	ErrUnknownUser                     scramError = "unknown-user"
-	ErrInvalidUsernameEncoding         scramError = "invalid-username-encoding"
-	ErrNoResources                     scramError = "no-resources"
-	ErrOtherError                      scramError = "other-error"
+	ErrInvalidEncoding                 = message.ErrInvalidEncoding
+	ErrExtensionsNotSupported          = message.ErrExtensionsNotSupported
+	ErrInvalidProof                    = message.ErrInvalidProof
+	ErrChannelBindingsDontMatch        = message.ErrChannelBindingsDontMatch
+	ErrServerDoesSupportChannelBinding = message.ErrServerDoesSupportChannelBinding
+	ErrChannelBindingNotSupported      = message.ErrChannelBindingNotSupported
+	ErrUnsupportedChannelBindingType   = message.ErrUnsupportedChannelBindingType
+	ErrUnknownUser                     = message.ErrUnknownUser
+	ErrInvalidUsernameEncoding         = message.ErrInvalidUsernameEncoding
+	ErrNoResources                     = message.ErrNoResources
+	ErrOtherError                      = message.ErrOtherError
+)
+
+// Local errors. These describe configuration or peer misbehavior and are not sent on the wire.
+var (
+	ErrInvalidKeys            = errors.New("scram: keys are missing or have the wrong length")
+	ErrIterationsOutOfRange   = errors.New("scram: iteration count out of range")
+	ErrSaltTooShort           = errors.New("scram: salt too short")
+	ErrNonceMismatch          = errors.New("scram: nonce mismatch")
+	ErrInvalidServerSignature = errors.New("scram: invalid server signature")
+	ErrAuthzidNotAllowed      = errors.New("scram: authorization identity not allowed")
+	ErrConversationFinished   = errors.New("scram: conversation already finished")
 )
